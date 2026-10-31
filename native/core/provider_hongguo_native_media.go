@@ -6,34 +6,164 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// resolveHongguoAppMedia 取某集的 App 直链（0.7.17 起双路径）。
+//
+// 2026-10-30 起红果把播放接口单独改了规则：`multi_video_model/v1` **拒绝签名请求**，
+// 必须用 platform 注册的匿名身份、且不带任何签名头（见 `provider_hongguo_playback.go`）；
+// 带签名+随机身份会被软拦截成「HTTP 200 + 0 字节」。
+//
+// 因此这里按「无签名 → 六头签名」依次尝试，任一成功即返回；两条都失败才报错。
+// 这样服务端下次再在两种规则间切换时，客户端有机会自愈，不必等新版本。
 func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoID string) (providerMedia, error) {
 	if !hongguoNumericID.MatchString(videoID) {
 		return providerMedia{}, errors.New("红果视频 ID 无效")
 	}
-	payload := map[string]any{
-		"video_id": videoID, "content_type": 1,
-		"biz_param": map[string]any{"need_all_video_definition": true, "video_platform": 3},
-	}
-	result, err := downloader.hongguoAppRequest(ctx, http.MethodPost, "/novel/player/video_model/v1/", nil, payload)
-	if err != nil {
-		return providerMedia{}, err
-	}
-	data := nestedMap(result, "data")
-	model, _ := data["video_model"].(map[string]any)
-	if encoded, ok := data["video_model"].(string); ok {
-		decoder := json.NewDecoder(strings.NewReader(encoded))
-		decoder.UseNumber()
-		if err := decoder.Decode(&model); err != nil {
-			return providerMedia{}, errors.New("红果 App 播放信息格式异常")
+	model, unsignedErr := downloader.hongguoPlaybackModel(ctx, videoID)
+	if unsignedErr == nil {
+		if media, err := downloader.hongguoMediaFromModel(ctx, model); err == nil {
+			return media, nil
+		} else {
+			unsignedErr = err
 		}
 	}
-	return selectHongguoAppMedia(model)
+	signedModel, signedErr := downloader.hongguoSignedPlaybackModel(ctx, videoID)
+	if signedErr == nil {
+		if media, err := downloader.hongguoMediaFromModel(ctx, signedModel); err == nil {
+			return media, nil
+		} else {
+			signedErr = err
+		}
+	}
+	return providerMedia{}, fmt.Errorf("红果取流失败：无签名路径(%v)；签名路径(%v)", unsignedErr, signedErr)
+}
+
+// hongguoMediaFromModel 从 video_model 选流；只在必要时跟随 `fallback_api`。
+func (downloader *Downloader) hongguoMediaFromModel(ctx context.Context, model map[string]any) (providerMedia, error) {
+	if len(model) == 0 {
+		return providerMedia{}, errors.New("红果未返回片源模型")
+	}
+	if media, err := selectHongguoAppMedia(model); err == nil {
+		return media, nil
+	} else if media, ok := downloader.hongguoFallbackMedia(ctx, model); ok {
+		return media, nil
+	} else {
+		return providerMedia{}, err
+	}
+}
+
+// hongguoSignedPlaybackModel 走六头签名路径取 video_model（0.7.16 及以前的方式，保留兜底）。
+func (downloader *Downloader) hongguoSignedPlaybackModel(ctx context.Context, videoID string) (map[string]any, error) {
+	payload := map[string]any{
+		"biz_param": map[string]any{
+			"detail_page_version":       0,
+			"device_level":              3,
+			"disable_digg_stat":         false,
+			"need_all_video_definition": true,
+			"need_mp4_align":            false,
+			"use_os_player":             false,
+			"use_server_dns":            false,
+			"video_platform":            1024,
+		},
+		"mixed_video_id_map": map[string]any{"1004": []string{videoID}},
+	}
+	extra := url.Values{
+		"host_abi":                {"arm64-v8a"},
+		"dragon_device_type":      {"phone"},
+		"pv_player":               {"73532"},
+		"compliance_status":       {"0"},
+		"need_personal_recommend": {"1"},
+		"player_so_load":          {"1"},
+		"is_android_pad_screen":   {"0"},
+	}
+	result, err := downloader.hongguoAppRequest(ctx, http.MethodPost, "/novel/player/multi_video_model/v1/", extra, payload)
+	if err != nil {
+		return nil, err
+	}
+	entry := nestedMap(nestedMap(result, "data"), videoID)
+	model := hongguoVideoModel(entry["video_model"])
+	if len(model) == 0 {
+		return nil, errors.New("红果 App 未返回该集播放信息")
+	}
+	return model, nil
+}
+
+// hongguoVideoModel 把 `video_model`（可能是 JSON 字符串或对象）转成 map。
+func hongguoVideoModel(value any) map[string]any {
+	switch typed := value.(type) {
+	case string:
+		var parsed map[string]any
+		decoder := json.NewDecoder(strings.NewReader(typed))
+		decoder.UseNumber()
+		if decoder.Decode(&parsed) != nil {
+			return map[string]any{}
+		}
+		return parsed
+	case map[string]any:
+		return typed
+	}
+	return map[string]any{}
+}
+
+// hongguoFallbackMedia 跟随 `fallback_api` 二次取片源。
+func (downloader *Downloader) hongguoFallbackMedia(ctx context.Context, model map[string]any) (providerMedia, bool) {
+	address := hongguoFallbackAddress(model["fallback_api"])
+	if address == "" {
+		return providerMedia{}, false
+	}
+	parsed, err := url.Parse(address)
+	if err != nil || parsed.Scheme != "https" || (!strings.HasSuffix(parsed.Hostname(), "fqnovel.com") && !strings.HasSuffix(parsed.Hostname(), "snssdk.com")) {
+		return providerMedia{}, false
+	}
+	text, err := downloader.fetchProviderText(ctx, address, hongguoBaseURL+"/")
+	if err != nil {
+		return providerMedia{}, false
+	}
+	var outer map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	if decoder.Decode(&outer) != nil {
+		return providerMedia{}, false
+	}
+	info := nestedMap(outer, "video_info", "data")
+	if len(info) == 0 {
+		return providerMedia{}, false
+	}
+	if media, err := selectHongguoAppMedia(info); err == nil {
+		return media, true
+	}
+	return providerMedia{}, false
+}
+
+// hongguoFallbackAddress 解析 `fallback_api` 的多种形态。
+func hongguoFallbackAddress(value any) string {
+	switch typed := value.(type) {
+	case string:
+		var parsed map[string]any
+		decoder := json.NewDecoder(strings.NewReader(typed))
+		if decoder.Decode(&parsed) == nil {
+			if address, ok := parsed["fallback_api"].(string); ok {
+				return address
+			}
+		}
+		return typed
+	case []any:
+		if len(typed) == 0 {
+			return ""
+		}
+		address, _ := typed[0].(string)
+		return address
+	case map[string]any:
+		address, _ := typed["fallback_api"].(string)
+		return address
+	}
+	return ""
 }
 
 func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {
