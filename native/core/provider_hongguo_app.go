@@ -49,6 +49,7 @@ type hongguoAppClient struct {
 	suggestPending map[string]*hongguoSuggestionCall
 	danmaku        map[string]hongguoDanmakuCacheEntry
 	danmakuPending map[string]*hongguoDanmakuCall
+}
 
 
 func (downloader *Downloader) hongguoClient() *hongguoAppClient {

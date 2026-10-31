@@ -1,5 +1,6 @@
 name: duanju_app
-description: 鐙珛杩愯鐨勫绔煭鍓у簲鐢?publish_to: none
+description: 独立运行的多端短剧应用
+publish_to: none
 version: 0.2.65+72
 
 environment:
